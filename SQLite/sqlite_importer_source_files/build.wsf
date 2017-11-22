@@ -1,0 +1,205 @@
+<job>
+	<script language="JScript">
+	
+	
+		var FSO = new ActiveXObject('Scripting.FileSystemObject');
+		
+		
+		var ScriptDir = WScript.ScriptFullName.substring(
+			0, WScript.ScriptFullName.lastIndexOf(WScript.ScriptName) - 1
+		);
+		
+		
+		var Registry = (function(){
+			var Registry = {
+				HKLM: 0x80000002,	// HKEY_LOCAL_MACHINE
+				WshShell: WScript.CreateObject("WScript.Shell"),
+				Service: null,
+				Reg: null,
+				Method: null,
+				ParamsIn: null,
+				GetSubKeys: function (regPath) {
+					this.Method = this.Reg.Methods_.Item("EnumKey");
+					this.ParamsIn = this.Method.InParameters.SpawnInstance_();
+					this.ParamsIn.hDefKey = this.HKLM;
+					this.ParamsIn.sSubKeyName = regPath;
+					var rawResult = this.Reg.ExecMethod_(this.Method.Name, this.ParamsIn);
+					if (rawResult.ReturnValue === 0 && rawResult.sNames != null) {
+						return rawResult.sNames.toArray();
+					}
+					return [];
+				},
+				GetValue: function (regPath) {
+					var result = null;
+					try {
+						result = this.WshShell.RegRead("HKLM\\" + regPath);
+					} catch (e) {
+					}
+					return result;
+				},
+				_init: function () {
+					this.Service = GetObject("winmgmts:{impersonationLevel=impersonate}!\\\\.\\root\\default");
+					this.Reg = this.Service.Get("StdRegProv");
+				}
+			};
+			Registry._init();
+			return Registry;
+		})();
+		
+		
+		var Shell = {
+			_cmd: new ActiveXObject("WScript.Shell"),
+			// exec command fn with stdout
+			Exec: function (cmd) {
+				var oExec   	= this._cmd.Exec(cmd),
+					resultBool	= true,
+					resultStr	= '',
+					tryCount	= 0,
+					loopEnd		= false,
+					localOutStr	= '';
+				while (true) {
+					loopEnd = false;
+					if (!oExec.StdOut.AtEndOfStream) {
+						loopEnd = true;
+						localOutStr = oExec.StdOut.ReadAll();
+					}
+					if (!oExec.StdErr.AtEndOfStream) {
+						loopEnd = true;
+						resultBool = false;
+						localOutStr = oExec.StdErr.ReadAll();
+					} 
+					if (!loopEnd) {
+						if (tryCount++ > 10 && oExec.Status == 1) {
+							break;
+						}
+						WScript.Sleep(100);
+					} else {
+						resultStr += localOutStr;
+						tryCount = 0;
+					}
+				}
+				return {
+					success: resultBool, 
+					data: resultStr
+				};
+			}
+		};
+		
+		
+		var HttpGet = function (url, fullPath) {
+			var xhr = new ActiveXObject("MSXML2.XMLHTTP");
+			xhr.open("GET", url, false);
+			xhr.send();
+			if (xhr.Status == 200) {
+				var fso = new ActiveXObject("Scripting.FileSystemObject");
+				if (fso.FileExists(fullPath)) fso.DeleteFile(fullPath);
+				var stream = new ActiveXObject("ADODB.Stream");
+				stream.Open();
+				stream.Type = 1; //adTypeBinary
+				stream.Write(xhr.ResponseBody);
+				stream.Position = 0;    
+				stream.SaveToFile(fullPath);
+				stream.Close();
+				return true;
+			} else {
+				WScript.Echo("HTTP Error: " + xhr.status + " "+ xhr.statusText);
+				return false;
+			}
+		};
+		
+		
+		var CSCompillerDetector = {
+			registryRootPath: "SOFTWARE\\Microsoft\\NET Framework Setup\\NDP",
+			versionSubKeyRegExp: /^v([0-9\.]*)$/, // v2.0.50727 | v3.5 | v4 | v4.0 ...
+			fso: new ActiveXObject('Scripting.FileSystemObject'),
+			FoundLatest: function (minVersion) {
+				var versionsAndPaths = this._getLatest(minVersion);
+				if (!versionsAndPaths.length) return [];
+				versionsAndPaths.sort(function (a, b) {
+					return a[0].localeCompare(b[0]);
+				});
+				// return last founded version of C# .net compiller
+				var result = versionsAndPaths[versionsAndPaths.length - 1];
+				result[1] += "MSBuild.exe";
+				return result;
+			},
+			_getLatest: function (minVersion) {
+				var versionsSubKeys = Registry.GetSubKeys(this.registryRootPath),
+					versionMatch = [],
+					versionFloat = 0.0,
+					installPath = "",
+					versionsAndPaths = [];
+				for (var i = 0; i < versionsSubKeys.length; ++i) {
+					versionMatch = this.versionSubKeyRegExp.exec(versionsSubKeys[i]);
+					if (versionMatch && versionMatch.length > 0) {
+						versionFloat = parseFloat(versionMatch[1]);
+						if (versionFloat < minVersion) continue;
+						if (versionFloat < 4) {
+							installPath = Registry.GetValue(
+								this.registryRootPath 
+								+ "\\v" + versionMatch[1] + "\\InstallPath"
+							);
+							if (installPath && this.fso.FileExists(installPath + "MSBuild.exe")) {
+								versionsAndPaths.push([versionMatch[1], installPath]);
+							}
+						} else {
+							installPath = Registry.GetValue(
+								this.registryRootPath 
+								+ "\\v" + versionMatch[1] + "\\Full\\InstallPath"
+							);
+							if (!installPath) {
+								installPath = Registry.GetValue(
+									this.registryRootPath 
+									+ "\\v" + versionMatch[1] + "\\Client\\InstallPath"
+								);
+							}
+							if (installPath && this.fso.FileExists(installPath + "MSBuild.exe")) {
+								versionsAndPaths.push([versionMatch[1], installPath])
+							};
+						}
+					}
+				};
+				return versionsAndPaths;
+			}
+		};
+		
+		
+		WScript.Echo("Searching for MSBuild.exe in system registry:");
+		var CSCompiller = CSCompillerDetector.FoundLatest(4);
+		if (!CSCompiller.length) {
+			WScript.Echo("No MSBuild.exe found on this machine.");
+			WScript.Quit();
+		} else {
+			WScript.Echo("Founded MSBuild.exe v." + CSCompiller[0] + " in path: " + CSCompiller[1]);
+		}
+		
+		
+		WScript.Echo("Updating Nuget packages:");
+		var nugetDownloadResult = HttpGet(
+			"https://dist.nuget.org/win-x86-commandline/latest/nuget.exe", 
+			ScriptDir + "\\nuget.exe"
+		);
+		if (!nugetDownloadResult) WScript.Quit();
+		var updateResult = Shell.Exec(ScriptDir + "\\nuget.exe restore SQLiteImporter.sln");
+		if (updateResult.success && FSO.FolderExists(ScriptDir + "\\packages")) {
+			WScript.Echo("Nuget packages for SQLiteImporter solution restored successfully.");
+		} else {
+			WScript.Echo("Updating Nuget packages for SQLiteImporter failed:\n\n");
+			WScript.Echo(buildResult.data);
+			WScript.Quit();
+		};
+		
+		
+		WScript.Echo("Building SQLiteImporter.exe from sources:");
+		var buildResult = Shell.Exec(CSCompiller[1] + " SQLiteImporter.sln /property:Configuration=Release /p:BuildProjectReferences=true");
+		if (buildResult.success && FSO.FileExists(ScriptDir + "\\SQLiteImporter.exe")) {
+			WScript.Echo("SQLiteImporter.exe successfully builded.");
+		} else {
+			WScript.Echo("Building of SQLiteImporter.exe failed:\n\n");
+			WScript.Echo(buildResult.data);
+			WScript.Quit();
+		};
+		
+		
+	</script>
+</job>
